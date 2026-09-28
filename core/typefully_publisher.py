@@ -180,8 +180,8 @@ class TypefullyDraftPublisher:
             return "dry-run-media"
 
         ext = Path(image_path).suffix.lower()
-        if ext not in (".jpg", ".jpeg", ".png"):
-            ops.error(f"Desteklenmeyen görsel uzantısı: {ext}")
+        if ext not in (".jpg", ".jpeg", ".png", ".mp4", ".mov"):
+            ops.error(f"Desteklenmeyen medya uzantısı: {ext}")
             return ""
         safe_stem = "".join(c if ((c.isascii() and c.isalnum()) or c in "_.()-") else "_"
                             for c in Path(image_path).stem)[:200]

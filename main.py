@@ -166,12 +166,13 @@ def _run_flow(kind: str) -> None:
             )
             return
 
-        # 3) Görsel
+        # 3) Medya Üretimi (Yapay Zeka Video veya Görsel)
         img_gen = ImageGenerator()
-        ops.info("Adım 3/4", "Kie AI: görsel üretimi")
-        image_path = img_gen.generate_post_image(post_text)
+        ops.info("Adım 3/4", "Kie AI: Medya üretimi (Konuya göre dinamik AI Video veya Görsel)")
+        media_path, media_type = img_gen.generate_post_media(post_text)
+        image_path = media_path
         if not image_path and not settings.IS_DRY_RUN:
-            raise RuntimeError("Görsel üretilemedi — görselsiz LinkedIn postu atılmaz")
+            raise RuntimeError("Medya üretilemedi — medyası olmayan LinkedIn postu atılmaz")
 
         # 4) Yayıncı + Notion log + onay maili.
         from core.threads_adapter import ThreadsAdapter
@@ -195,7 +196,7 @@ def _run_flow(kind: str) -> None:
                     text=post_text, image_path=image_path, threads_posts=th_posts or None)
         else:
             publisher = TypefullyDraftPublisher(social_set_id=target_ss_id)
-            ops.info("Adım 4/4", f"Typefully'ye LinkedIn-only draft yükleniyor (ss_id={target_ss_id})")
+            ops.info("Adım 4/4", f"Typefully'ye LinkedIn-only draft yükleniyor (ss_id={target_ss_id}, medya={media_type})")
             draft = publisher.create_linkedin_only_draft(
                 text=post_text, image_path=image_path, threads_posts=th_posts or None,
                 social_set_id=target_ss_id)
@@ -223,6 +224,7 @@ def _run_flow(kind: str) -> None:
                     title_prefix=title_prefix,
                     post_text=post_text,
                     image_path=image_path,
+                    media_type=media_type,
                     draft_url=draft.get("share_url", ""),
                     draft_id=draft.get("draft_id", ""),
                     social_set_id=target_ss_id,

@@ -101,6 +101,7 @@ def _build_single_post_html(
     draft_url: str,
     publish_url: str = "",
     has_inline_image: bool = False,
+    media_type: str = "image",
 ) -> str:
     """Tek bir gönderi için çift butonlu (Hemen Yayınla + Düzenle) HTML e-posta gövdesi oluşturur."""
     acc = ACCOUNT_INFO.get(account_key, {
@@ -119,10 +120,25 @@ def _build_single_post_html(
             f'⭐ Kalite: {score_val:.1f}/10</span>'
         )
 
-    # Görsel bloğu (CID referansı)
-    image_html = ""
-    if has_inline_image:
-        image_html = (
+    # Medya bloğu (Video veya Görsel)
+    media_html = ""
+    if media_type == "video":
+        media_html = f"""
+        <div style="margin:18px 0;background:#0f172a;border-radius:12px;padding:24px 20px;text-align:center;border:1px solid #334155;color:#f8fafc;box-shadow:0 4px 16px rgba(0,0,0,0.12);">
+          <div style="font-size:36px;margin-bottom:8px;">🎬</div>
+          <div style="font-size:16px;font-weight:800;color:#38bdf8;margin-bottom:4px;">16:9 Yapay Zeka Videosu Hazırlandı</div>
+          <div style="font-size:13px;color:#94a3b8;line-height:1.5;max-width:440px;margin:0 auto;">
+            Bu gönderi için konunun dinamik akışına uygun 16:9 formatında sinematik yapay zeka videosu üretildi ve Typefully taslağınıza eklendi.
+          </div>
+          <div style="margin-top:14px;">
+            <span style="background:rgba(56,189,248,0.15);color:#38bdf8;padding:5px 14px;border-radius:16px;font-size:11px;font-weight:700;border:1px solid rgba(56,189,248,0.3);">
+              Kie AI · 16:9 Sinematik Video (.mp4)
+            </span>
+          </div>
+        </div>
+        """
+    elif has_inline_image:
+        media_html = (
             '<div style="margin:16px 0;text-align:center;">'
             '<img src="cid:post_image" alt="LinkedIn Görseli" '
             'style="max-width:100%;height:auto;border-radius:10px;border:1px solid #e2e8f0;'
@@ -198,8 +214,8 @@ def _build_single_post_html(
           <div>{score_badge}</div>
         </div>
 
-        <!-- Üretilen Görsel -->
-        {image_html}
+        <!-- Üretilen Medya (Görsel veya Video) -->
+        {media_html}
 
         <!-- Post Metni Kartı -->
         <div style="background:#f8fafc;border-left:4px solid {acc['theme_color']};border-radius:8px;padding:16px;margin:16px 0;font-size:14px;line-height:1.65;color:#334155;border-top:1px solid #f1f5f9;border-right:1px solid #f1f5f9;border-bottom:1px solid #f1f5f9;">
@@ -279,6 +295,7 @@ def send_post_approval_mail(
     draft_id: str | int = "",
     social_set_id: str | int = "",
     image_path: str | None = None,
+    media_type: str = "image",
     score: float | int | None = None,
     recipient: str | None = None,
 ) -> bool:
@@ -288,6 +305,10 @@ def send_post_approval_mail(
 
     acc_title = ACCOUNT_INFO.get(account_key, {}).get("title", title_prefix)
     subject = f"[Onay Bekliyor] LinkedIn: {acc_title} — {title_prefix}"
+
+    # Medya türü kontrolü
+    if image_path and any(image_path.lower().endswith(ext) for ext in [".mp4", ".mov", ".webm"]):
+        media_type = "video"
 
     # Yayınlama URL'i (onay_web /yayinla ucu)
     base_url = _get_approval_base_url()
@@ -301,7 +322,7 @@ def send_post_approval_mail(
     # Düzenleme linki: her zaman doğrudan Typefully editörüdür
     edit_url = draft_url or f"https://typefully.com/?d={draft_id}&a={social_set_id}"
 
-    has_inline_image = bool(image_path and os.path.exists(image_path))
+    has_inline_image = bool(image_path and os.path.exists(image_path) and media_type != "video")
     html_body = _build_single_post_html(
         account_key=account_key,
         title_prefix=title_prefix,
@@ -310,6 +331,7 @@ def send_post_approval_mail(
         draft_url=edit_url,
         publish_url=publish_url,
         has_inline_image=has_inline_image,
+        media_type=media_type,
     )
     plain_fallback = (
         f"{title_prefix}\n\n{post_text}\n\n"

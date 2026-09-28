@@ -13,11 +13,10 @@ from openai import OpenAI
 
 from config import settings
 
-# GPT Image 2 (kullanici isteği 2026-06-22). Eski "Kie'de 500" notu ESKİDİ — model bugün
-# çalışıyor + Türkçe metni diakritikleriyle net basıyor + nano-banana-2'nin airbrushed
-# dokusuna göre çok daha keskin/gerçekçi (canlı doğrulandı). Twitter_Text ile aynı motor.
+# GPT Image 2 (görsel motoru) ve Gemini Omni Video (video motoru)
 KIE_MODEL = "gpt-image-2-text-to-image"
 KIE_RESOLUTION = "2K"
+KIE_VIDEO_MODEL = os.getenv("KIE_VIDEO_MODEL", "gemini-omni-video")
 
 _REALISM = (
     "Ultra-realistic editorial photograph, shot on a professional camera (Canon EOS R5, 50mm), "
@@ -80,26 +79,157 @@ class ImageGenerator:
         api_key = os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY
         self.openai_client = OpenAI(api_key=api_key)
 
-    def generate_post_image(self, post_text: str) -> str:
+    def generate_post_media(self, post_text: str, force_type: str | None = None) -> tuple[str, str]:
         """
-        1. GPT-4.1-mini ile görsel promptu üretir.
-        2. Kie AI API'sine istek atar.
-        3. Üretilen görseli temp klasörüne indirir.
+        Post metnini analiz ederek dinamik olarak görsel veya video üretir.
         
         Returns:
-            İndirilen görselin lokal dosya yolu.
+            (media_path, media_type) -> (".../temp.mp4", "video") veya (".../temp.png", "image")
         """
         if settings.IS_DRY_RUN:
-            ops.info("[DRY-RUN] Görsel prompt üretme atlanıyor.")
-            ops.info("[DRY-RUN] Kie AI görsel üretme atlanıyor.")
+            ops.info("[DRY-RUN] Medya üretme atlanıyor.")
+            return None, "image"
+
+        intent = self._analyze_media_intent(post_text)
+        media_type = force_type or intent.get("media_type", "image")
+        scene_en = intent.get("scene_en", "")
+        headline_tr = intent.get("headline_tr", "")
+
+        ops.info("Medya Kararı", f"Seçilen format: {media_type.upper()} | Sebep: {intent.get('reason', '-')}")
+
+        if media_type == "video":
+            video_path = self._generate_and_download_video_from_kie(scene_en)
+            if video_path and os.path.exists(video_path):
+                return video_path, "video"
+            ops.warning("Kie AI video üretimi tamamlanamadı; otomatik olarak statik görsele geçiliyor...")
+
+        # Statik görsel üretimi (varsayılan veya video fallback)
+        print_headline = os.getenv("LINKEDIN_IMAGE_HEADLINE", "0") == "1"
+        if print_headline and headline_tr:
+            prompt = _assemble_image_prompt(headline_tr, scene_en, "Wide 16:9 landscape composition")
+        else:
+            prompt = _assemble_image_prompt_clean(scene_en, "Wide 16:9 landscape composition")
+
+        image_path = self._generate_and_download_from_kie(prompt)
+        return image_path, "image"
+
+    def generate_post_image(self, post_text: str) -> str:
+        """Geriye dönük uyumluluk: doğrudan üretilen medya dosya yolunu döner."""
+        path, _ = self.generate_post_media(post_text)
+        return path
+
+    def _analyze_media_intent(self, post_text: str) -> dict:
+        """Post metninden: video mu görsel mi kararı + başlık + İngilizce sahne açıklaması çıkarır."""
+        import json as _json
+        system_message = (
+            "You are an expert creative director for an executive LinkedIn channel in Turkey (covering Solido Grup B2B, Takalike e-commerce, and AI). "
+            "Your job is to analyze a LinkedIn post and decide the best media format: VIDEO or IMAGE.\n\n"
+            "CRITERIA:\n"
+            "- Choose 'video' (16:9 cinematic video) if the post discusses: dynamic physical processes, warehouse logistics, "
+            "shipping/delivery, tool workflows, automation in action, fast-paced marketplace operations, or tangible business momentum.\n"
+            "- Choose 'image' (16:9 editorial photograph) if the post discusses: analytical metrics, strategic thinking, rules/checklists, "
+            "mindset, questions/polls, or quiet executive reflection.\n\n"
+            "HARD BANS for scene_en: no glowing holographic brains, no robot hands, no futuristic sci-fi neon, no cartoon/CGI characters, no money bags, no floating binary code.\n\n"
+            "Output JSON with:\n"
+            '  "media_type": "video" or "image",\n'
+            '  "reason": "1 short sentence explaining why video or image was chosen",\n'
+            '  "headline_tr": "Short punchy Turkish headline (max 7 words)",\n'
+            '  "scene_en": "Concrete real-world cinematic description (camera movement if video, depth of field)"'
+        )
+        user_message = f"LinkedIn post (Turkish):\n\n{post_text}"
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7,
+                max_tokens=400,
+            )
+            data = _json.loads(response.choices[0].message.content)
+            if not data.get("scene_en"):
+                data["scene_en"] = "Modern professional enterprise headquarters with natural daylight"
+            return data
+        except Exception as e:
+            ops.warning("Medya intent analizi hatası, varsayılan görsele geçiliyor", str(e))
+            return {
+                "media_type": "image",
+                "reason": "fallback",
+                "headline_tr": "",
+                "scene_en": "Modern professional corporate environment with warm natural light"
+            }
+
+    def _generate_and_download_video_from_kie(self, scene_en: str) -> str | None:
+        """Kie AI jobs/createTask üzerinden 16:9 sinematik video üretir ve indirir."""
+        KIE_BASE = "https://api.kie.ai/api/v1"
+        headers = {
+            "Authorization": f"Bearer {settings.KIE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        prompt = (
+            f"Cinematic 16:9 realistic corporate documentary footage, natural 4k lighting, "
+            f"smooth steady camera movement, photorealistic texture. Scene: {scene_en}"
+        )
+        payload = {
+            "model": KIE_VIDEO_MODEL,
+            "input": {
+                "prompt": prompt,
+                "duration": "4",
+                "aspect_ratio": "16:9",
+            },
+        }
+        try:
+            ops.info(f"Kie AI video task oluşturuluyor ({KIE_VIDEO_MODEL})...")
+            r = requests.post(f"{KIE_BASE}/jobs/createTask", headers=headers, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            task_id = (data.get("data") or {}).get("taskId")
+            if not task_id:
+                ops.warning("Kie AI video taskId alınamadı", str(data)[:300])
+                return None
+            ops.info(f"Kie AI video task: {task_id}")
+        except Exception as e:
+            ops.warning("Kie AI video createTask hatası", str(e))
             return None
 
-        # Step 1: Prompt Üretimi (GPT-4o-mini)
-        prompt = self._generate_image_prompt(post_text)
-
-        # Step 2 & 3: Kie AI ile Üret ve İndir
-        image_path = self._generate_and_download_from_kie(prompt)
-        return image_path
+        poll_url = f"{KIE_BASE}/jobs/recordInfo"
+        for _ in range(36):  # ~3 dakika polling
+            time.sleep(5)
+            try:
+                pr = requests.get(poll_url, headers=headers, params={"taskId": task_id}, timeout=15)
+                pr.raise_for_status()
+                pd = pr.json()
+                d = pd.get("data") or {}
+                state = (d.get("state") or "").lower()
+                if state in ("success", "completed", "succeeded"):
+                    result = d.get("resultJson") or d.get("result") or {}
+                    if isinstance(result, str):
+                        import json as _json
+                        try:
+                            result = _json.loads(result)
+                        except Exception:
+                            result = {}
+                    urls = result.get("resultUrls") or result.get("urls") or []
+                    if urls and isinstance(urls, list):
+                        video_url = urls[0]
+                        ops.info(f"Video URL hazır: {video_url[:80]}…")
+                        vid_resp = requests.get(video_url, timeout=60)
+                        vid_resp.raise_for_status()
+                        fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(vid_resp.content)
+                        ops.success("Video başarıyla indirildi", temp_path)
+                        return temp_path
+                elif state in ("failed", "error"):
+                    msg = d.get("failMsg") or d.get("errorMsg", "?")
+                    ops.warning(f"Kie AI video task FAILED: {msg}")
+                    return None
+            except Exception as e:
+                ops.warning("Kie video polling hatası", str(e))
+        ops.warning("Kie AI video zaman aşımı, görsele dönülecek")
+        return None
 
     def _generate_image_prompt(self, post_text: str) -> str:
         """Post metninden: (ops.) kısa Türkçe başlık + İngilizce SOMUT sahne → tam prompt.

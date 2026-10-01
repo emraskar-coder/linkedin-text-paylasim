@@ -18,6 +18,7 @@ import hmac
 import json
 import base64
 import hashlib
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -253,6 +254,93 @@ def _build_single_post_html(
 </html>"""
 
 
+def _send_via_gmail_api(msg: MIMEMultipart, recipient: str) -> bool:
+    """Gmail REST API (HTTPS Port 443) üzerinden e-posta gönderir.
+    
+    Railway ve bulut ortamlarında SMTP portları (465/587) engellendiği için
+    standart HTTPS web protokolü üzerinden mesaj gönderir.
+    """
+    try:
+        token_data = None
+        # 1. Environment variable'dan JSON oku (Railway/Cloud)
+        env_json = os.environ.get("GOOGLE_PERSONAL_TOKEN_JSON") or os.environ.get("GOOGLE_TOKEN_JSON")
+        if env_json:
+            try:
+                token_data = json.loads(env_json)
+            except Exception:
+                token_data = None
+
+        # 2. Lokal dosya (development / local fallback)
+        if not token_data:
+            local_paths = [
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "_knowledge", "credentials", "oauth", "gmail-personal-token.json"),
+                os.path.join(os.path.dirname(__file__), "..", "credentials", "gmail-personal-token.json"),
+            ]
+            for p in local_paths:
+                p_abs = os.path.abspath(p)
+                if os.path.exists(p_abs):
+                    try:
+                        with open(p_abs, "r", encoding="utf-8") as f:
+                            token_data = json.load(f)
+                        break
+                    except Exception:
+                        pass
+
+        # 3. Bağımsız env değişkenleri
+        client_id = (token_data.get("client_id") if token_data else None) or os.environ.get("GMAIL_PERSONAL_CLIENT_ID")
+        client_secret = (token_data.get("client_secret") if token_data else None) or os.environ.get("GMAIL_PERSONAL_CLIENT_SECRET")
+        refresh_token = (token_data.get("refresh_token") if token_data else None) or os.environ.get("GMAIL_PERSONAL_REFRESH_TOKEN")
+
+        if not (client_id and client_secret and refresh_token):
+            ops.warning("Gmail API OAuth token bilgisi bulunamadı, SMTP fallback deneniyor")
+            return False
+
+        # Access token al
+        refresh_resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=15,
+        )
+        if refresh_resp.status_code != 200:
+            ops.warning(f"Gmail OAuth token yenilenemedi ({refresh_resp.status_code}): {refresh_resp.text[:200]}")
+            return False
+
+        access_token = refresh_resp.json().get("access_token")
+        if not access_token:
+            return False
+
+        # Mesajı raw base64url olarak hazırla
+        raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+        # Gmail API üzerinden gönder
+        send_resp = requests.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"raw": raw_b64},
+            timeout=20,
+        )
+
+        if send_resp.status_code in (200, 201):
+            sent_id = send_resp.json().get("id", "")
+            ops.success("Onay maili gönderildi (Gmail API HTTPS)", f"Alıcı: {recipient} | Msg ID: {sent_id}")
+            return True
+        else:
+            ops.warning(f"Gmail API gönderim yanıtı ({send_resp.status_code}): {send_resp.text[:200]}")
+            return False
+
+    except Exception as e:
+        ops.warning("Gmail API gönderim hatası", str(e))
+        return False
+
+
 def _send_via_gmail_smtp(msg: MIMEMultipart, recipient: str) -> bool:
     """Gmail SMTP (SSL 465 -> Fallback TLS 587) üzerinden e-posta gönderir."""
     sender_email = (os.environ.get("GMAIL_PERSONAL_EMAIL") or "").strip()
@@ -364,6 +452,11 @@ def send_post_approval_mail(
         except Exception as e:
             ops.warning("Görsel e-postaya iliştirilemedi", str(e))
 
+    # 1. Önce HTTPS üzerinden Gmail API dene (Railway/Cloud ortamında SMTP portları engellendiği için zorunlu)
+    if _send_via_gmail_api(msg, recipient_email):
+        return True
+
+    # 2. API yapılandırması yoksa veya başarısız olursa SMTP fallback
     return _send_via_gmail_smtp(msg, recipient_email)
 
 
